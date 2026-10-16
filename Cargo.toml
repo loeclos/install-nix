@@ -1,0 +1,22 @@
+[package]
+name = "install-nix"
+version = "0.1.0"
+edition = "2021"
+description = "Guided NixOS installer: pick a drive, auto-partition/format, and install the loeclos/dotfiles flake host"
+license = "MIT"
+authors = ["loeclos"]
+repository = "https://github.com/loeclos/install-nix"
+keywords = ["nixos", "installer", "flake"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "install-nix"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dialoguer = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
