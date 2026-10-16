@@ -30,7 +30,11 @@ struct Lsblk {
 struct LsblkDev {
     name: Option<String>,
     path: Option<String>,
-    size: Option<String>,
+    // NOTE: with `--bytes`, lsblk emits SIZE as a JSON number
+    // (e.g. `"size": 15703474176`); without it, a human string
+    // (e.g. `"size": "14.6G"`). Accept both — see parse_size().
+    #[serde(default)]
+    size: Option<serde_json::Value>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -100,7 +104,13 @@ pub fn list_disks() -> Result<Vec<Disk>> {
         ],
     )
     .context("lsblk failed; is util-linux installed?")?;
-    let parsed: Lsblk = serde_json::from_str(&out).context("failed to parse `lsblk -J` output")?;
+    parse_lsblk(&out)
+}
+
+/// Parse `lsblk -J` output into whole disks. Split from `list_disks` so
+/// fixtures (integer or string sizes) can be tested without hardware.
+fn parse_lsblk(out: &str) -> Result<Vec<Disk>> {
+    let parsed: Lsblk = serde_json::from_str(out).context("failed to parse `lsblk -J` output")?;
     let mut disks = Vec::new();
     for d in &parsed.blockdevices {
         if d.r#type.as_deref() != Some("disk") {
@@ -116,13 +126,12 @@ pub fn list_disks() -> Result<Vec<Disk>> {
             continue;
         }
         let path = d.path.clone().unwrap_or_else(|| format!("/dev/{name}"));
-        let size_h = d.size.clone().unwrap_or_else(|| "?".into());
-        let size_bytes = size_h.parse::<u64>().unwrap_or(0);
+        let (size_bytes, size_h) = parse_size(&d.size);
         let mut mounts = Vec::new();
         collect_mounts(d, &mut mounts);
         disks.push(Disk {
             path,
-            size_h: humansize(size_bytes, &size_h),
+            size_h,
             size_bytes,
             model: d.model.clone().unwrap_or_default().trim().to_string(),
             tran: d.tran.clone().unwrap_or_default().trim().to_string(),
@@ -132,6 +141,23 @@ pub fn list_disks() -> Result<Vec<Disk>> {
     }
     disks.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(disks)
+}
+
+/// Normalize the lsblk SIZE field to (bytes, human string).
+/// Numbers (from `--bytes`) and byte-count strings are humanized;
+/// anything else (e.g. `"14.6G"`, null) passes through with 0 bytes.
+fn parse_size(v: &Option<serde_json::Value>) -> (u64, String) {
+    match v {
+        Some(serde_json::Value::Number(n)) => {
+            let bytes = n.as_u64().unwrap_or(0);
+            (bytes, humansize(bytes, &n.to_string()))
+        }
+        Some(serde_json::Value::String(s)) => match s.parse::<u64>() {
+            Ok(bytes) => (bytes, humansize(bytes, s)),
+            Err(_) => (0, s.clone()),
+        },
+        _ => (0, "?".to_string()),
+    }
 }
 
 fn collect_mounts(dev: &LsblkDev, out: &mut Vec<String>) {
@@ -641,5 +667,50 @@ mod tests {
     #[test]
     fn unmount_order_is_leaf_first() {
         assert_eq!(planned_unmounts(), ["/mnt/boot", "/mnt"]);
+    }
+
+    /// Regression: `lsblk -J --bytes` emits `"size": 15703474176`
+    /// (a JSON number), which used to crash deserialization.
+    #[test]
+    fn parses_integer_byte_sizes() {
+        let out = r#"{"blockdevices": [
+            {"name":"sdc","path":"/dev/sdc","size":15703474176,
+             "model":"USB Flash Drive","tran":"usb","type":"disk",
+             "rm":true,"ro":false,"mountpoint":null,
+             "children":[
+               {"name":"sdc1","path":"/dev/sdc1","size":3205496832,
+                "model":null,"tran":null,"type":"part",
+                "rm":null,"ro":null,"mountpoint":null}]}
+        ]}"#;
+        let disks = parse_lsblk(out).unwrap();
+        assert_eq!(disks.len(), 1);
+        assert_eq!(disks[0].path, "/dev/sdc");
+        assert_eq!(disks[0].size_bytes, 15703474176);
+        assert_eq!(disks[0].size_h, "14.6G");
+        assert_eq!(disks[0].rm, "1");
+        assert!(disks[0].mounts.is_empty());
+    }
+
+    #[test]
+    fn parses_string_sizes() {
+        let out = r#"{"blockdevices": [
+            {"name":"sda","path":"/dev/sda","size":"500107862016",
+             "model":"CT500MX500SSD1","tran":"sata","type":"disk",
+             "rm":false,"ro":false,"mountpoint":null},
+            {"name":"sdb","path":"/dev/sdb","size":"14.6G",
+             "model":"stick","tran":"usb","type":"disk",
+             "rm":"0","ro":"0","mountpoint":null,
+             "children":[
+               {"name":"sdb1","path":"/dev/sdb1","size":"14.6G",
+                "type":"part","mountpoint":"/mnt/usb"}]}
+        ]}"#;
+        let disks = parse_lsblk(out).unwrap();
+        assert_eq!(disks.len(), 2);
+        assert_eq!(disks[0].size_bytes, 500107862016);
+        assert_eq!(disks[0].size_h, "465.8G");
+        // Non-numeric human sizes pass through with unknown bytes.
+        assert_eq!(disks[1].size_bytes, 0);
+        assert_eq!(disks[1].size_h, "14.6G");
+        assert_eq!(disks[1].mounts, vec!["/mnt/usb".to_string()]);
     }
 }
